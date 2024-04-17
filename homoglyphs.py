@@ -16,7 +16,6 @@ STRATEGY_REMOVE = 3  # remove char from result
 
 ASCII_RANGE = range(128)
 
-
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_LOCATION = os.path.join(CURRENT_DIR, "homoglyph_data")
 

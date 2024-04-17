@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 import collections
-from math import sqrt
+import math
+
+import random
 
 import scipy.stats
 
@@ -29,25 +31,48 @@ from nltk.util import ngrams
 
 from normalizers import normalization_strategy_lookup
 
+
 class WatermarkBase:
     def __init__(
         self,
+        num_colors: int,  # number of colors in colorlist
+        message: str = None,  # the message to be embedded. Message should be converted into string that only contains 0 or 1.
+        message_len: int = None,  # length of original message (only used when detection)
         vocab: list[int] = None,
-        gamma: float = 0.5,
+        # gamma: float = 0.5,
         delta: float = 2.0,
         seeding_scheme: str = "simple_1",  # mostly unused/always default
         hash_key: int = 15485863,  # just a large prime number to create a rng seed with sufficient bit width
-        select_green_tokens: bool = True,
+        # select_green_tokens: bool = True
     ):
         # watermarking parameters
         self.vocab = vocab
         self.vocab_size = len(vocab)
-        self.gamma = gamma # greenlist precentage
-        self.delta = delta # weight added to the greenlist
+        # self.gamma = gamma
+        self.delta = delta
         self.seeding_scheme = seeding_scheme
-        self.rng = None # random number generator
+        self.rng = None
         self.hash_key = hash_key
-        self.select_green_tokens = select_green_tokens
+        self.message = message
+        self.message_len = message_len if message_len is not None else len(message)  # message_len is only used in detection. And message is only in embedding.
+        self.num_colors = num_colors
+        self.converted_message = self._radix_convert(message, 2, num_colors, self.message_len) if message is not None else None  # convert binary string into r radix string
+        self.b_hat = int(math.ceil(self.message_len / math.log(self.num_colors, 2)))
+
+    def _radix_convert(self, message: str, input_r: int, output_r: int, message_len: int) -> str:
+        '''convert input_r radix input string into output_r radix output string'''
+        # Convert binary string to an integer
+        try:
+            num = int(message, input_r)
+        except ValueError:
+            print('Embedded message must be binary string')
+            return
+
+        digits = []
+        while num:
+            digits.append(int(num % output_r))
+            num //= output_r
+        return ''.join(str(x) for x in digits[::-1])
 
     def _seed_rng(self, input_ids: torch.LongTensor, seeding_scheme: str = None) -> None:
         # can optionally override the seeding scheme,
@@ -63,23 +88,49 @@ class WatermarkBase:
             raise NotImplementedError(f"Unexpected seeding_scheme: {seeding_scheme}")
         return
 
+    def _get_p_and_color_idx(self, previous_ids: torch.LongTensor, current_id: torch.LongTensor):
+        '''Return the position and color_idx for current token
+        '''
+        self._seed_rng(previous_ids)
+        color_size = int(self.vocab_size / self.num_colors)  # size of one color
+        vocab_permutation = torch.randperm(self.vocab_size, device=previous_ids.device, generator=self.rng)
+        position = torch.randint(0, self.b_hat, size=(1,), device=current_id.device, generator=self.rng).item()
+
+        color_idx = None  # if color_idx is None, it means current_id isn't in any color strip
+
+        for i in range(self.num_colors):
+            if current_id.item() in vocab_permutation[i * color_size:(i + 1) * color_size].tolist():
+                color_idx = i
+                break
+
+        return position, color_idx
+
     def _get_greenlist_ids(self, input_ids: torch.LongTensor) -> list[int]:
-        # seed the rng using the previous tokens/prefix
-        # according to the seeding_scheme
+        '''input_ids are the previous tokens used to seed genarator
+        Return the selected color from colorlist as greenlist(only used in watermark embedding)
+        '''
         self._seed_rng(input_ids)
 
-        greenlist_size = int(self.vocab_size * self.gamma)
+        color_size = int(self.vocab_size / self.num_colors)  # size of one color
+
         vocab_permutation = torch.randperm(self.vocab_size, device=input_ids.device, generator=self.rng)
-        if self.select_green_tokens:  # directly
-            greenlist_ids = vocab_permutation[:greenlist_size]  # new
-        else:  # select green via red
-            greenlist_ids = vocab_permutation[(self.vocab_size - greenlist_size) :]  # legacy behavior
+
+        # this is colorlist
+        # colorlist_ids=[vocab_permutation[i*color_size:(i+1)*color_size] for i in range(self.num_colors)]
+        b_hat = self.b_hat
+
+        position = torch.randint(0, b_hat, size=(1,), device=input_ids.device, generator=self.rng).item()
+
+        m = int(self.converted_message[b_hat - position - 1])
+
+        greenlist_ids = vocab_permutation[m * color_size:(m + 1) * color_size]
+
         return greenlist_ids
 
 
 class WatermarkLogitsProcessor(WatermarkBase, LogitsProcessor):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, num_colors, message, **kwargs):
+        super().__init__(num_colors=num_colors, message=message, **kwargs)
 
     def _calc_greenlist_mask(self, scores: torch.FloatTensor, greenlist_token_ids) -> torch.BoolTensor:
         # TODO lets see if we can lose this loop
@@ -94,7 +145,6 @@ class WatermarkLogitsProcessor(WatermarkBase, LogitsProcessor):
         return scores
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-
         # this is lazy to allow us to colocate on the watermarked model's device
         if self.rng is None:
             self.rng = torch.Generator(device=input_ids.device)
@@ -120,9 +170,9 @@ class WatermarkDetector(WatermarkBase):
         *args,
         device: torch.device = None,
         tokenizer: Tokenizer = None,
-        z_threshold: float = 4.0,
+        # z_threshold: float = 4.0,
         normalizers: list[str] = ["unicode"],  # or also: ["unicode", "homoglyphs", "truecase"]
-        ignore_repeated_bigrams: bool = True,
+        ignore_repeated_bigrams: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -132,7 +182,7 @@ class WatermarkDetector(WatermarkBase):
 
         self.tokenizer = tokenizer
         self.device = device
-        self.z_threshold = z_threshold
+        # self.z_threshold = z_threshold
         self.rng = torch.Generator(device=self.device)
 
         if self.seeding_scheme == "simple_1":
@@ -148,17 +198,74 @@ class WatermarkDetector(WatermarkBase):
         if self.ignore_repeated_bigrams:
             assert self.seeding_scheme == "simple_1", "No repeated bigram credit variant assumes the single token seeding scheme."
 
-    def _compute_z_score(self, observed_count, T):
-        # count refers to number of green tokens, T is total number of tokens
-        expected_count = self.gamma
-        numer = observed_count - expected_count * T
-        denom = sqrt(T * expected_count * (1 - expected_count))
-        z = numer / denom
-        return z
+    # def _compute_z_score(self, observed_count, T):
+    #    # count refers to number of green tokens, T is total number of tokens
+    #    expected_count = self.gamma
+    #    numer = observed_count - expected_count * T
+    #    denom = sqrt(T * expected_count * (1 - expected_count))
+    #    z = numer / denom
+    #    return z
 
-    def _compute_p_value(self, z):
-        p_value = scipy.stats.norm.sf(z)
-        return p_value
+    # def _compute_p_value(self, z):
+    #    p_value = scipy.stats.norm.sf(z)
+    #    return p_value
+
+    def _decode_sequence(
+        self,
+        input_ids: Tensor
+    ):
+        if self.ignore_repeated_bigrams:
+            '''Only counts a green/red hit for unique bigram, not each word. This would add some robustness.
+            '''
+            # Method that only counts a green/red hit once per unique bigram.
+            # New num total tokens scored (T) becomes the number unique bigrams.
+            # We iterate over all unqiue token bigrams in the input, computing the greenlist
+            # induced by the first token in each, and then checking whether the second
+            # token falls in that greenlist.
+            bigram_table = {}
+            token_bigram_generator = ngrams(input_ids.cpu().tolist(), 2)
+            freq = collections.Counter(token_bigram_generator)
+            num_tokens_scored = len(freq.keys())
+            for idx, bigram in enumerate(freq.keys()):
+                prefix = torch.tensor([bigram[0]], device=self.device)  # expects a 1-d prefix tensor on the randperm device
+                greenlist_ids = self._get_greenlist_ids(prefix)
+                bigram_table[bigram] = True if bigram[1] in greenlist_ids else False
+            green_token_count = sum(bigram_table.values())
+        else:
+            num_tokens_scored = len(input_ids) - self.min_prefix_len
+            if num_tokens_scored < 1:
+                raise ValueError(
+                    (
+                        f"Must have at least {1} token to score after "
+                        f"the first min_prefix_len={self.min_prefix_len} tokens required by the seeding scheme."
+                    )
+                )
+            # Standard method.
+            # Since we generally need at least 1 token (for the simplest scheme)
+            # we start the iteration over the token sequence with a minimum
+            # num tokens as the first prefix for the seeding scheme,
+            # and at each step, compute the greenlist induced by the
+            # current prefix and check if the current token falls in the greenlist.
+            green_token_count, green_token_mask = 0, []
+
+            b_hat = self.b_hat    # maximun length of converted message
+
+            w = torch.zeros(size=(b_hat, self.num_colors), dtype=torch.int8)  # counter for message decoding
+
+            for idx in range(self.min_prefix_len, len(input_ids)):
+                curr_token = input_ids[idx]
+                p, color_idx = self._get_p_and_color_idx(input_ids[:idx], curr_token)
+
+                if color_idx is not None:
+                    w[p, color_idx] += 1
+
+            converted_message = torch.argmax(w, dim=1)
+            print(converted_message)
+            converted_message = converted_message.tolist()[::-1]
+            converted_message = ''.join([str(x) for x in converted_message])
+            message = self._radix_convert(converted_message, self.num_colors, 2, self.message_len)
+
+        return {'message': message}
 
     def _score_sequence(
         self,
@@ -171,6 +278,8 @@ class WatermarkDetector(WatermarkBase):
         return_p_value: bool = True,
     ):
         if self.ignore_repeated_bigrams:
+            '''Only counts a green/red hit for unique bigram, not each word. This would add some robustness.
+            '''
             # Method that only counts a green/red hit once per unique bigram.
             # New num total tokens scored (T) becomes the number unique bigrams.
             # We iterate over all unqiue token bigrams in the input, computing the greenlist
@@ -234,15 +343,15 @@ class WatermarkDetector(WatermarkBase):
         self,
         text: str = None,
         tokenized_text: list[int] = None,
-        return_prediction: bool = True,
-        return_scores: bool = True,
-        z_threshold: float = None,
+        # return_prediction: bool = True,
+        # return_scores: bool = True,
+        # z_threshold: float = None,
         **kwargs,
     ) -> dict:
+        '''Return the decode result of text
+        '''
 
         assert (text is not None) ^ (tokenized_text is not None), "Must pass either the raw or tokenized string"
-        if return_prediction:
-            kwargs["return_p_value"] = True  # to return the "confidence":=1-p of positive detections
 
         # run optional normalizers on text
         for normalizer in self.normalizers:
@@ -266,17 +375,17 @@ class WatermarkDetector(WatermarkBase):
 
         # call score method
         output_dict = {}
-        score_dict = self._score_sequence(tokenized_text, **kwargs)
-        if return_scores:
-            output_dict.update(score_dict)
+        score_dict = self._decode_sequence(tokenized_text, **kwargs)
+        output_dict.update(score_dict)
+
+        # if return_scores:
+        #    output_dict.update(score_dict)
         # if passed return_prediction then perform the hypothesis test and return the outcome
-        if return_prediction:
-            z_threshold = z_threshold if z_threshold else self.z_threshold
-            assert z_threshold is not None, "Need a threshold in order to decide outcome of detection test"
-            output_dict["prediction"] = score_dict["z_score"] > z_threshold
-            if output_dict["prediction"]:
-                output_dict["confidence"] = 1 - score_dict["p_value"]
+        # if return_prediction:
+        #    z_threshold = z_threshold if z_threshold else self.z_threshold
+        #    assert z_threshold is not None, "Need a threshold in order to decide outcome of detection test"
+        #    output_dict["prediction"] = score_dict["z_score"] > z_threshold
+        #    if output_dict["prediction"]:
+        #        output_dict["confidence"] = 1 - score_dict["p_value"]
 
         return output_dict
-
-
